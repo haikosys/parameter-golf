@@ -2,8 +2,11 @@
 set -e
 cd /workspace/parameter-golf
 
-# Get the v2 script (SOTA #1 base + LoRA TTT + stride=32)
-curl -sL "https://api.github.com/repos/haikosys/parameter-golf/contents/records/track_10min_16mb/2026-03-20_LoRATTT_Stride32_EMA_Seq2048/train_gpt.py?ref=submission/seq2048-ema-council" | python3 -c "import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)['content']).decode())" > our_v2.py
+# Get v2 script by cloning the fork
+if [ ! -d "/workspace/my_fork" ]; then
+  git clone -b submission/seq2048-ema-council https://github.com/haikosys/parameter-golf.git /workspace/my_fork
+fi
+cp /workspace/my_fork/records/track_10min_16mb/2026-03-20_LoRATTT_Stride32_on_SOTA1/train_gpt.py our_v2.py
 echo "Downloaded v2: $(wc -l < our_v2.py) lines"
 
 for SEED in 42 1337 7; do
