@@ -671,7 +671,9 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, drop_rate: float = 0.0) -> Tensor:
+        if self.training and drop_rate > 0 and torch.rand(1).item() < drop_rate:
+            return x  # Stochastic depth: skip this layer
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self.ln_scale_factor
@@ -752,7 +754,7 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, stoch_depth: float = 0.1) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -760,14 +762,15 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
+        drop = stoch_depth if self.training else 0.0
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, drop_rate=drop)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, drop_rate=drop)
 
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -780,7 +783,8 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        return main_loss
+        z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+        return main_loss + 1e-4 * z_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
