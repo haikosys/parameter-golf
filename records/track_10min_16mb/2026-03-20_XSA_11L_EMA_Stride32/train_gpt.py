@@ -34,14 +34,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
-# -----------------------------
 # HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -69,7 +62,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -93,7 +86,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 32))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
@@ -102,15 +95,15 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.02))
     adam_wd = float(os.environ.get("ADAM_WD", 0.01))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 1.02))
+    trigram_vocab_size = int(os.environ.get("TRIGRAM_VOCAB_SIZE", 0))
 
-# -----------------------------
 # MUON OPTIMIZER
-# -----------------------------
 #
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
@@ -127,7 +120,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
-
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
@@ -191,15 +183,8 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 
-
-# -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
 #
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -227,7 +212,6 @@ def build_sentencepiece_luts(
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
-
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -238,7 +222,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
-
 
 def eval_val(
     args: Hyperparameters,
@@ -300,13 +283,8 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-# -----------------------------
 # POST-TRAINING QUANTIZATION
-# -----------------------------
 #
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -444,10 +422,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         out[name] = out_t
     return out
 
-
-# -----------------------------
 # DATA LOADING 
-# -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -464,7 +439,6 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
-
 
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
@@ -496,7 +470,6 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
-
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
@@ -516,9 +489,7 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-# -----------------------------
 # TRANSFORMER MODULES
-# -----------------------------
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -527,7 +498,6 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
-
 
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
@@ -544,14 +514,12 @@ class CastedLinear(nn.Linear):
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
-
 
 class Rotary(nn.Module):
     # NTK-aware RoPE: auto-scales base frequency when seq_len exceeds train_seq_len.
@@ -586,12 +554,10 @@ class Rotary(nn.Module):
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -649,7 +615,6 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
-
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -659,7 +624,6 @@ class SmearGate(nn.Module):
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
-
 
 class BigramHashEmbedding(nn.Module):
     def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
@@ -686,7 +650,6 @@ class BigramHashEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
-
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -698,7 +661,6 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
-
 
 class Block(nn.Module):
     def __init__(
@@ -726,7 +688,6 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
-
 
 class GPT(nn.Module):
     def __init__(
@@ -875,10 +836,7 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-
-# -----------------------------
 # SLIDING WINDOW EVALUATION
-# -----------------------------
 
 def eval_val_sliding(
     args: Hyperparameters,
@@ -933,6 +891,11 @@ def eval_val_sliding(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
 
+            # Temperature scaling: reduces overconfidence in quantized models
+            eval_temp = args.eval_temperature if hasattr(args, 'eval_temperature') else 1.0
+            if eval_temp != 1.0:
+                logits = logits / eval_temp
+
             nll = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
                 y_batch.reshape(-1),
@@ -962,10 +925,7 @@ def eval_val_sliding(
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
 
-
-# -----------------------------
 # INT6 MIXED QUANTIZATION (transplanted from working diagnostic scripts)
-# -----------------------------
 
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
@@ -1042,10 +1002,7 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = (q.float() * float(s.item())).to(orig_dtype)
     return out
 
-
-# -----------------------------
 # TRAINING
-# -----------------------------
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -1054,9 +1011,7 @@ def main() -> None:
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
-    # -----------------------------
     # DISTRIBUTED + CUDA SETUP
-    # -----------------------------
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1112,9 +1067,7 @@ def main() -> None:
     )
     log0("=" * 100, console=False)
 
-    # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
-    # -----------------------------
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1140,9 +1093,7 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
-    # -----------------------------
     # MODEL + OPTIMIZER SETUP
-    # -----------------------------
 
     CastedLinear._qat_enabled = args.qat_enabled
 
@@ -1174,7 +1125,6 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
@@ -1252,9 +1202,7 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    # -----------------------------
     # DATA LOADER & MODEL WARMUP
-    # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
@@ -1303,9 +1251,7 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # -----------------------------
     # MAIN TRAINING LOOP
-    # -----------------------------
 
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -1439,9 +1385,7 @@ def main() -> None:
         del swa_state
         base_model.load_state_dict(avg_state, strict=True)
 
-    # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
-    # -----------------------------
 
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
@@ -1549,7 +1493,6 @@ def main() -> None:
 
     if distributed:
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
