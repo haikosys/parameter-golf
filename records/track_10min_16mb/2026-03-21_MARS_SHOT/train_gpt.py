@@ -780,8 +780,7 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
-        return main_loss + 1e-4 * z_loss
+        return main_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
