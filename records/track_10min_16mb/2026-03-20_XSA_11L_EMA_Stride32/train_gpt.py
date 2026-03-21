@@ -98,10 +98,9 @@ class Hyperparameters:
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 1.02))
-    trigram_vocab_size = int(os.environ.get("TRIGRAM_VOCAB_SIZE", 0))
 
 # MUON OPTIMIZER
 #
