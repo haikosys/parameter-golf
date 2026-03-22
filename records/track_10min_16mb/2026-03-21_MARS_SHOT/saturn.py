@@ -677,7 +677,7 @@ class CausalSelfAttention(nn.Module):
         self.use_xsa = False  # set by GPT.__init__ for deep layers only
         self.use_eodiff = False  # set by GPT.__init__ for even/odd differential
         # Lambda scalar for even/odd differential (learned, initialized to 0.5)
-        self.eodiff_lambda = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        self.register_buffer("eodiff_lambda", torch.tensor(0.5, dtype=torch.float32))
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Efficient XSA: subtract self-value projection via GQA-aware reshape (no repeat_interleave).
