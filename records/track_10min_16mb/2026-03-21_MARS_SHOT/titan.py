@@ -481,6 +481,10 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
         0,
     )
 
+    adaptive = bool(int(os.environ.get("ADAPTIVE_QUANT", "1")))
+    gptq = bool(int(os.environ.get("GPTQ_ENABLED", "1")))
+    num_layers = max((_get_layer_idx(n) for n in state_dict if 'blocks.' in n), default=10) + 1
+
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
         stats["param_count"] += int(t.numel())
@@ -501,9 +505,6 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        adaptive = bool(int(os.environ.get("ADAPTIVE_QUANT", "1")))
-        gptq = bool(int(os.environ.get("GPTQ_ENABLED", "1")))
-        num_layers = max((_get_layer_idx(n) for n in state_dict if 'blocks.' in n), default=10) + 1
         li = _get_layer_idx(name)
         if adaptive and t.ndim == 2 and li >= 0:
             sens = _classify_sensitivity(name, li, num_layers)
@@ -897,8 +898,8 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
-        self.backout_alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
-        self.backout_layer = num_layers // 2
+        self.register_buffer("backout_alpha", torch.tensor(0.1, dtype=torch.float32))
+        self.backout_layer = self.num_encoder_layers // 2  # mid-encoder, not mid-network
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
