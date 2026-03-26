@@ -48,9 +48,11 @@ _TURBO_CODEBOOKS = {2: CODEBOOK_2BIT, 3: CODEBOOK_3BIT, 4: CODEBOOK_4BIT}
 
 _turbo_rotation_cache: Dict[Tuple[int, int], Tensor] = {}
 
+@torch.compiler.disable
 def _turbo_get_codebook(bits: int, dim: int, device='cpu') -> Tensor:
     return _TURBO_CODEBOOKS[bits].to(device=device) / math.sqrt(dim)
 
+@torch.compiler.disable
 def _turbo_get_rotation(dim: int, seed: int = 42, device='cpu') -> Tensor:
     key = (dim, seed)
     if key not in _turbo_rotation_cache or _turbo_rotation_cache[key].device != torch.device(device):
@@ -80,6 +82,7 @@ def turbo_ste(weight: Tensor, rotation: Tensor, codebook: Tensor) -> Tensor:
 
 _turbo_cb_cache: Dict[Tuple[int, int, str], Tensor] = {}
 
+@torch.compiler.disable
 def _turbo_cached_cb(bits: int, dim: int, device) -> Tensor:
     key = (bits, dim, str(device))
     if key not in _turbo_cb_cache:
