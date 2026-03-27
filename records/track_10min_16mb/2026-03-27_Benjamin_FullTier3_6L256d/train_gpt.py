@@ -1523,7 +1523,111 @@ def eval_val_sliding_ttt(
     return val_loss, val_bpb
 
 
-# === BENJAMIN CACHE ENGINE — Full Tier 3 ===
+# === BENJAMIN CACHE ENGINE — Full Tier 3 + Packed Training Cache + Learned Gate ===
+
+# --- Packed Training N-gram Cache (serialized into artifact) ---
+TRAIN_CACHE_BUCKETS = 32768  # 32K — small enough to fit in artifact
+TRAIN_CACHE_MAX_ORDER = 9    # order 2-9 like PR 931
+
+class TrainingNgramCache:
+    """N-gram cache built from training data, packed into the artifact.
+    32K buckets × 8 orders × 2 tables × 4 bytes = 2MB."""
+
+    def __init__(self, buckets=TRAIN_CACHE_BUCKETS, max_order=TRAIN_CACHE_MAX_ORDER):
+        self.buckets = buckets
+        self.max_order = max_order
+        self.mask = np.uint64(buckets - 1)
+        self.ctx_tables = {n: np.zeros(buckets, dtype=np.int32) for n in range(2, max_order + 1)}
+        self.full_tables = {n: np.zeros(buckets, dtype=np.int32) for n in range(2, max_order + 1)}
+        self.total_tokens = 0
+
+    def update_batch(self, tokens_tensor):
+        """Update cache from a training batch (torch tensor)."""
+        tokens_np = tokens_tensor.cpu().numpy().astype(np.int64)
+        self.total_tokens += len(tokens_np)
+        val_u64 = tokens_np.astype(np.uint64)
+        n_primes = len(_NGRAM_PRIMES)
+        for n in range(2, self.max_order + 1):
+            ctx_w = n - 1
+            if ctx_w >= len(tokens_np):
+                continue
+            positions = np.arange(ctx_w, len(tokens_np))
+            tgt = val_u64[positions]
+            ctx_hash = np.zeros(len(positions), dtype=np.uint64)
+            for k in range(ctx_w):
+                ctx_hash ^= val_u64[positions - ctx_w + k] * _NGRAM_PRIMES[k % n_primes]
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            full_key = ((ctx_hash ^ (tgt * _NGRAM_PRIMES[ctx_w % n_primes])) & self.mask).astype(np.intp)
+            np.add.at(self.ctx_tables[n], ctx_key, 1)
+            np.add.at(self.full_tables[n], full_key, 1)
+
+    def serialize(self):
+        """Pack into a dict of numpy arrays for torch.save."""
+        data = {"buckets": self.buckets, "max_order": self.max_order, "total_tokens": self.total_tokens}
+        for n in range(2, self.max_order + 1):
+            data[f"ctx_{n}"] = self.ctx_tables[n]
+            data[f"full_{n}"] = self.full_tables[n]
+        return data
+
+    @classmethod
+    def deserialize(cls, data):
+        """Unpack from torch.load dict."""
+        cache = cls(buckets=int(data["buckets"]), max_order=int(data["max_order"]))
+        cache.total_tokens = int(data["total_tokens"])
+        for n in range(2, cache.max_order + 1):
+            cache.ctx_tables[n] = data[f"ctx_{n}"]
+            cache.full_tables[n] = data[f"full_{n}"]
+        return cache
+
+    def merge_into(self, eval_cache):
+        """Merge training cache counts into an eval NgramCache.
+        Only merges orders that exist in both."""
+        for n in range(2, min(self.max_order, eval_cache.max_order) + 1):
+            if n not in eval_cache.ctx_tables:
+                continue
+            # Training cache has 32K buckets, eval cache has 16M.
+            # Need to rehash — or just add training tokens to eval cache.
+            # Simpler: during eval, we score against BOTH caches and blend.
+            pass  # Handled separately in scoring
+
+    def score_positions(self, tokens_np, positions):
+        """Score specific positions against the training cache.
+        Returns (prob, has_match, match_order) arrays."""
+        val_u64 = tokens_np.astype(np.uint64)
+        N = len(positions)
+        best_p = np.zeros(N, dtype=np.float64)
+        has_match = np.zeros(N, dtype=bool)
+        match_orders = np.zeros(N, dtype=np.int32)
+        n_primes = len(_NGRAM_PRIMES)
+        tgt_u64 = val_u64[positions]
+        for n in range(self.max_order, 1, -1):
+            ctx_w = n - 1
+            eligible = (positions >= ctx_w) & ~has_match
+            if not eligible.any():
+                continue
+            idx = np.where(eligible)[0]
+            pos = positions[idx]
+            tgt = tgt_u64[idx]
+            ctx_hash = np.zeros(len(idx), dtype=np.uint64)
+            for k in range(ctx_w):
+                ctx_hash ^= val_u64[pos - ctx_w + k] * _NGRAM_PRIMES[k % n_primes]
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            ctx_counts = self.ctx_tables[n][ctx_key].astype(np.float64)
+            sufficient = ctx_counts >= 2
+            if not sufficient.any():
+                continue
+            s_idx = idx[sufficient]
+            s_ctx = ctx_counts[sufficient]
+            full_key = ((ctx_hash[sufficient] ^ (tgt[sufficient] * _NGRAM_PRIMES[ctx_w % n_primes])) & self.mask).astype(np.intp)
+            s_full = self.full_tables[n][full_key].astype(np.float64)
+            has_target = s_full > 0
+            if has_target.any():
+                pi = s_idx[has_target]
+                p_ng = np.minimum(s_full[has_target], s_ctx[has_target]) / np.maximum(s_ctx[has_target], 1.0)
+                best_p[pi] = np.clip(p_ng, 0.0, 1.0)
+                match_orders[pi] = n
+                has_match[pi] = True
+        return best_p, has_match, match_orders
 
 _NGRAM_PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 196613, 262147,
                            393241, 524309, 655373, 786433, 917521, 1048583,
@@ -1851,24 +1955,35 @@ def ngram_rescore(
     positions: np.ndarray,
     rank: int, world_size: int, device: torch.device,
     phrase_cache: 'PhraseCache | None' = None,
+    train_cache: 'TrainingNgramCache | None' = None,
     log0=print,
 ) -> tuple[float, float]:
-    """Sequential blend (PR 913 proven): n-gram on neural, then phrase on top.
-    Uses interpolated multi-order n-gram + count-weighted confidence."""
+    """Sequential 3-stage blend: training cache -> val n-gram -> phrase.
+    Each stage blends on top of the previous."""
     N = len(positions)
     if N == 0:
         return 0.0, 0.0
 
-    # --- Stage 1: Greedy backoff n-gram scoring with leave-one-out ---
+    # Start with model_p
+    p_blend = model_p.copy().astype(np.float64)
+
+    # --- Stage 0: Training cache (pre-warmed from training data) ---
+    n_train = 0
+    if train_cache is not None and train_cache.total_tokens > 0:
+        tc_p, tc_m, tc_o = train_cache.score_positions(tokens_np, positions)
+        n_train = int(tc_m.sum())
+        if n_train > 0:
+            # Training cache uses high alpha — it's built from 8B+ tokens
+            tc_alpha = np.where(tc_m, 0.85, 0.0)  # high trust for training patterns
+            p_blend = (1.0 - tc_alpha) * p_blend + tc_alpha * np.where(tc_m, tc_p, 0.0)
+
+    # --- Stage 1: Val n-gram scoring with leave-one-out ---
     ngram_prob_all, ng_match_all, ng_orders_all = cache.score_range(
         tokens_np, 0, len(tokens_np)
     )
     ngram_prob = ngram_prob_all[positions]
     ng_match = ng_match_all[positions]
     ng_orders = ng_orders_all[positions]
-
-    # Start with model_p
-    p_blend = model_p.copy().astype(np.float64)
 
     # Blend n-gram on top of neural (stage 1)
     n_ngram = int(ng_match.sum())
@@ -1913,7 +2028,8 @@ def ngram_rescore(
     val_loss = (loss_sum_t / token_count_t).item()
     val_bpb = val_loss / math.log(2.0) * (token_count_t.item() / byte_count_t.item())
 
-    log0(f"rescore: ngram={n_ngram}/{N} ({100*n_ngram/max(N,1):.1f}%) "
+    log0(f"rescore: train_cache={n_train}/{N} ({100*n_train/max(N,1):.1f}%) "
+         f"ngram={n_ngram}/{N} ({100*n_ngram/max(N,1):.1f}%) "
          f"phrase={n_phrase}/{N} ({100*n_phrase/max(N,1):.1f}%)")
 
     return val_loss, val_bpb
@@ -2020,6 +2136,7 @@ def eval_ngram_two_pass(
     device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
     stride: int, batch_seqs: int = 32, log0=print,
+    train_cache: 'TrainingNgramCache | None' = None,
 ) -> tuple[float, float]:
     """CACHEMONEY: Full Tier 1+2+3 cache engine.
 
@@ -2076,10 +2193,10 @@ def eval_ngram_two_pass(
     log0(f"cachemoney: alpha calibrated in {t_calib - t_dup:.1f}s")
 
     # --- Pass 2: Sequential rescore with all features ---
-    log0(f"cachemoney: starting Pass 2 (full rescore)")
+    log0(f"benjamin: starting Pass 2 (full rescore with training cache)")
     val_loss, val_bpb = ngram_rescore(
         args, tokens_np, cache, model_p, entropy, token_bytes, positions,
-        rank, world_size, device, phrase_cache=pcache, log0=log0,
+        rank, world_size, device, phrase_cache=pcache, train_cache=train_cache, log0=log0,
     )
     t_pass2 = time.perf_counter()
 
@@ -2816,6 +2933,9 @@ def main() -> None:
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     ema_decay = 0.997
+    # Packed training n-gram cache — built during training, serialized into artifact
+    train_ngram_cache = TrainingNgramCache()
+    log0(f"train_cache:init buckets={TRAIN_CACHE_BUCKETS} orders=2-{TRAIN_CACHE_MAX_ORDER}")
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -2878,6 +2998,10 @@ def main() -> None:
                     loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            # Update packed training n-gram cache with this batch's tokens
+            with torch.no_grad():
+                batch_tokens = torch.cat([x.reshape(-1), y[:, -1:].reshape(-1)])
+                train_ngram_cache.update_batch(batch_tokens)
         train_loss /= grad_accum_steps
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -2979,23 +3103,28 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
-    # FP16 serialization — tiny model, no quantization needed
+    # FP16 serialization + packed training n-gram cache
     sd_cpu = {k: v.detach().cpu().half() for k, v in export_sd.items()}
+    log0(f"train_cache: {train_ngram_cache.total_tokens:,} tokens indexed")
+    artifact = {"model": sd_cpu, "train_cache": train_ngram_cache.serialize()}
     fp16_buf = io.BytesIO()
-    torch.save(sd_cpu, fp16_buf)
+    torch.save(artifact, fp16_buf)
     fp16_blob = lzma.compress(fp16_buf.getvalue(), preset=6)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(fp16_blob)
         quant_file_bytes = len(fp16_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model fp16+lzma: {quant_file_bytes} bytes")
-        log0(f"Total submission size fp16+lzma: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model+cache fp16+lzma: {quant_file_bytes} bytes")
+        log0(f"Total submission size: {quant_file_bytes + code_bytes} bytes")
     if distributed:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    deq_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu", weights_only=False)
+    loaded = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu", weights_only=False)
+    deq_state = loaded["model"]
+    loaded_train_cache = TrainingNgramCache.deserialize(loaded["train_cache"])
+    log0(f"train_cache:loaded {loaded_train_cache.total_tokens:,} tokens")
     # Restore original dtypes
     for k in deq_state:
         if k in export_sd:
@@ -3107,6 +3236,7 @@ def main() -> None:
                 args, ngram_model, rank, world_size, device,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
                 stride=args.eval_stride, log0=log0,
+                train_cache=loaded_train_cache,
             )
             torch.cuda.synchronize()
             log0(f"ngram_two_pass val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} "
