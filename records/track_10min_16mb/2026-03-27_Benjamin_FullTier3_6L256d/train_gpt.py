@@ -312,7 +312,7 @@ class Hyperparameters:
     # N-gram eval cache
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
-    ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", 24))
+    ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", 16))
     ngram_num_buckets = int(os.environ.get("NGRAM_NUM_BUCKETS", 16_777_216))  # 16M
     ngram_chunk_size = int(os.environ.get("NGRAM_CHUNK_SIZE", 512))
     ngram_alpha_min = float(os.environ.get("NGRAM_ALPHA_MIN", 0.05))
@@ -1659,8 +1659,8 @@ _PHRASE_PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 196613, 262147,
                             13631497, 13762571, 13893641, 14024713, 14155783,
                             14286857, 14417929, 14549003, 14680081, 14811149], dtype=np.uint64)
 
-# Tier 3: 8 phrase lengths including very long (128)
-_PHRASE_LENGTHS = [128, 96, 80, 64, 48, 32, 24, 16]  # longest first
+# Tier 3: 4 phrase lengths (fast build, ~96s)
+_PHRASE_LENGTHS = [64, 48, 32, 16]  # longest first
 
 # Legacy compat for single_pass code path (not used in two_pass mode)
 _ORDER_MULTS = np.array([0.30, 0.30, 0.97, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
@@ -1974,7 +1974,7 @@ def ngram_rescore(
         n_train = int(tc_m.sum())
         if n_train > 0:
             # Training cache uses high alpha — it's built from 8B+ tokens
-            tc_alpha = np.where(tc_m, 0.85, 0.0)  # high trust for training patterns
+            tc_alpha = np.where(tc_m, getattr(train_cache, '_blend_alpha', 0.85), 0.0)
             p_blend = (1.0 - tc_alpha) * p_blend + tc_alpha * np.where(tc_m, tc_p, 0.0)
 
     # --- Stage 1: Val n-gram scoring with leave-one-out ---
@@ -2065,7 +2065,8 @@ def detect_duplicate_regions(tokens_np, block_size=256, log0=print):
 
 
 def online_alpha_calibrate(cache, phrase_cache, tokens_np, model_p, entropy,
-                            positions, calib_frac=0.05, log0=print):
+                            positions, calib_frac=0.05, log0=print,
+                            train_cache=None):
     """Calibrate alpha parameters on first calib_frac of scored tokens.
     Returns tuned (alpha_high, entropy_thresh) for the n-gram cache."""
     N = len(positions)
@@ -2099,35 +2100,53 @@ def online_alpha_calibrate(cache, phrase_cache, tokens_np, model_p, entropy,
         ph_l_c = ph_l_full[calib_offset]
 
     best_pa = phrase_cache.base_alpha if phrase_cache is not None else 0.90
+    best_tca = 0.85
 
-    # Grid search — tune n-gram alpha AND phrase base_alpha
+    # Pre-compute training cache scores if available
+    tc_p_c = None
+    tc_m_c = None
+    if train_cache is not None and train_cache.total_tokens > 0:
+        tc_p_c, tc_m_c, _ = train_cache.score_positions(tokens_np, calib_pos)
+
+    # Grid search — tune n-gram + phrase + training cache alpha
     for ah in [0.90, 0.95, 0.97, 0.99]:
-        for et in [2.5, 3.0, 3.5, 4.0, 5.0]:
+        for et in [2.5, 3.0, 3.5, 4.0]:
             for pba in ([0.85, 0.90, 0.95, 0.99] if phrase_cache is not None else [0.90]):
-                cache.alpha_high = ah
-                cache.entropy_thresh = et
-                if phrase_cache is not None:
-                    phrase_cache.base_alpha = pba
-                p_test = calib_mp.copy().astype(np.float64)
-                if ng_m_c.any():
-                    a = cache.get_alpha(calib_ent[ng_m_c], ng_o_c[ng_m_c])
-                    p_test[ng_m_c] = (1.0 - a) * p_test[ng_m_c] + a * ng_p_c[ng_m_c]
-                if ph_m_c is not None and ph_m_c.any():
-                    pa = phrase_cache.get_alpha(ph_l_c[ph_m_c], calib_ent[ph_m_c])
-                    p_test[ph_m_c] = (1.0 - pa) * p_test[ph_m_c] + pa * ph_p_c[ph_m_c]
-                nll = -np.log(np.maximum(p_test, 1e-12)).mean()
-                if nll < best_nll:
-                    best_nll = nll
-                    best_ah = ah
-                    best_et = et
-                    best_pa = pba
+                for tca in ([0.70, 0.80, 0.85, 0.90, 0.95] if tc_m_c is not None and tc_m_c.any() else [0.85]):
+                    cache.alpha_high = ah
+                    cache.entropy_thresh = et
+                    if phrase_cache is not None:
+                        phrase_cache.base_alpha = pba
+                    p_test = calib_mp.copy().astype(np.float64)
+                    # Stage 0: training cache
+                    if tc_m_c is not None and tc_m_c.any():
+                        tc_a = np.where(tc_m_c, tca, 0.0)
+                        p_test = (1.0 - tc_a) * p_test + tc_a * np.where(tc_m_c, tc_p_c, 0.0)
+                    # Stage 1: val n-gram
+                    if ng_m_c.any():
+                        a = cache.get_alpha(calib_ent[ng_m_c], ng_o_c[ng_m_c])
+                        p_test[ng_m_c] = (1.0 - a) * p_test[ng_m_c] + a * ng_p_c[ng_m_c]
+                    # Stage 2: phrase
+                    if ph_m_c is not None and ph_m_c.any():
+                        pa = phrase_cache.get_alpha(ph_l_c[ph_m_c], calib_ent[ph_m_c])
+                        p_test[ph_m_c] = (1.0 - pa) * p_test[ph_m_c] + pa * ph_p_c[ph_m_c]
+                    nll = -np.log(np.maximum(p_test, 1e-12)).mean()
+                    if nll < best_nll:
+                        best_nll = nll
+                        best_ah = ah
+                        best_et = et
+                        best_pa = pba
+                        best_tca = tca
 
     cache.alpha_high = best_ah
     cache.entropy_thresh = best_et
     if phrase_cache is not None:
         phrase_cache.base_alpha = best_pa
+    if train_cache is not None:
+        train_cache._blend_alpha = best_tca
     log0(f"alpha_calib: best alpha_high={best_ah:.2f} entropy_thresh={best_et:.1f} "
-         f"phrase_base_alpha={best_pa:.2f} calib_nll={best_nll:.4f} (on {n_calib} tokens)")
+         f"phrase_alpha={best_pa:.2f} train_alpha={best_tca:.2f} "
+         f"calib_nll={best_nll:.4f} (on {n_calib} tokens)")
     return best_ah, best_et
 
 
@@ -2188,7 +2207,7 @@ def eval_ngram_two_pass(
 
     # --- Tier 2: Online alpha calibration ---
     log0(f"cachemoney: calibrating alpha on first 5% of tokens")
-    online_alpha_calibrate(cache, pcache, tokens_np, model_p, entropy, positions, log0=log0)
+    online_alpha_calibrate(cache, pcache, tokens_np, model_p, entropy, positions, log0=log0, train_cache=train_cache)
     t_calib = time.perf_counter()
     log0(f"cachemoney: alpha calibrated in {t_calib - t_dup:.1f}s")
 
@@ -2974,13 +2993,7 @@ def main() -> None:
             break
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # TurboQuant progressive QAT: 4-bit -> 3-bit -> 2-bit during warmdown
-        _turbo_scheduler.update(scale)
-        if _turbo_scheduler.enabled and not _turbo_qat_enabled:
-            _turbo_qat_enabled = True
-            log0(f"turbo_qat:enabled step:{step} bits:{_turbo_scheduler.bits} scale:{scale:.4f}")
-        elif _turbo_qat_enabled and _turbo_scheduler.enabled:
-            pass  # bits update handled by scheduler
+        # TurboQuant QAT disabled — FP16 model, no quantization needed
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -2998,11 +3011,13 @@ def main() -> None:
                     loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
-            # Update packed training n-gram cache with this batch's tokens
-            with torch.no_grad():
-                batch_tokens = torch.cat([x.reshape(-1), y[:, -1:].reshape(-1)])
-                train_ngram_cache.update_batch(batch_tokens)
         train_loss /= grad_accum_steps
+        # Update training cache every 10th step (keeps step time fast)
+        if step % 10 == 0:
+            with torch.no_grad():
+                # Use x (input) tokens only — no cross-sequence contamination
+                for seq_idx in range(x.shape[0]):
+                    train_ngram_cache.update_batch(x[seq_idx])
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
