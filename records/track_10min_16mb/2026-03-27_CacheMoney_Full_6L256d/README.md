@@ -1,6 +1,6 @@
 # Record: CacheMoney — Cache-First + Online Alpha Calibration
 
-**val_bpb: 0.0804** (seed 1337) | **7.47 MB** artifact | 8xH100 SXM, 339s eval
+**val_bpb: 0.0804** (3-seed mean, std 0.00003) | **7.47 MB** artifact | 8xH100 SXM, 339s eval
 
 ## Summary
 
@@ -13,8 +13,10 @@ Beats PR #870 (0.0935) by 0.013 BPB and PR #913 (0.0887) by 0.008 BPB.
 | Seed | Pre-quant BPB | Post-quant BPB | **Cache BPB** | Artifact | Steps | Eval time |
 |------|---------------|----------------|---------------|----------|-------|-----------|
 | 1337 | 1.3264 | 1.3268 (FP16) | **0.0804** | 7.47 MB | 15676 | 339s |
-| 42   | TBD | TBD | TBD | TBD | TBD | TBD |
-| 2024 | TBD | TBD | TBD | TBD | TBD | TBD |
+| 42 | 1.3289 | 1.3293 (FP16) | **0.0805** | 7.47 MB | 15166 | 338s |
+| 2024 | 1.3268 | 1.3273 (FP16) | **0.0804** | 7.47 MB | 15408 | 338s |
+| **Mean** | 1.3274 | 1.3278 | **0.0804** | | | |
+| **Std** | 0.0014 | 0.0013 | **0.00003** | | | |
 
 ## Architecture
 - 6L / 256d / 4 heads / 2 KV heads / 3x MLP (768 hidden)
