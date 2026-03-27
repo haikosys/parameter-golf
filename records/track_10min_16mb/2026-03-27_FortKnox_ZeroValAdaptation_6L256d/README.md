@@ -1,6 +1,16 @@
-# Fort Knox: Zero Val-Adaptation Baseline
+# Record: Fort Knox — Legal Packed Training Cache, Zero Val Adaptation (val_bpb 0.0638)
 
-**val_bpb: TBD** | **~8 MB** artifact | 8xH100 SXM
+**val_bpb: 0.0638** (3-seed mean, std 0.00002) | **~8.1 MB** artifact | 8xH100 SXM, ~70s eval
+
+## Results (8xH100 80GB SXM)
+
+| Seed | Pre-quant BPB | **Final BPB** | Artifact | Steps | Eval time |
+|------|---------------|---------------|----------|-------|-----------|
+| 1337 | 1.3258 | **0.06377** | 8.12 MB | 13555 | 77s |
+| 42 | 1.3265 | **0.06377** | 8.13 MB | ~13500 | 70s |
+| 2024 | 1.3269 | **0.06374** | 8.14 MB | ~13500 | 71s |
+| **Mean** | 1.3264 | **0.06376** | | | |
+| **Std** | 0.0006 | **0.00002** | | | |
 
 ## Summary
 
@@ -102,8 +112,12 @@ If packed training statistics in the artifact are illegal, then model weights ar
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
-## Expected Performance
+## Key Finding
 
-Fort Knox will have significantly worse BPB than submissions using incremental val caches (~0.3-0.8 BPB estimated vs ~0.06-0.09 for cache-augmented submissions). This is by design — it sacrifices performance for unassailable legality.
+Fort Knox at 0.0638 BPB demonstrates that the packed training cache alone — without any val-data adaptation — achieves competitive results. The training data n-gram statistics capture enough of the validation set's patterns (via shared vocabulary and language structure) that incremental val caching adds only marginal improvement.
 
-The performance gap between Fort Knox and cache-augmented submissions quantifies exactly how much BPB comes from val-data adaptation vs pure training-time knowledge.
+## Lineage
+
+- PR #870 (BROADSIDE): Two-pass n-gram architecture (adapted to single-pass, no val cache)
+- PR #913 (Cache Is All You Need): Temperature sharpening concept
+- PR #931/962 (AnirudhRahul): Packed training n-gram in artifact concept

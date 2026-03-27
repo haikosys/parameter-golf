@@ -1,0 +1,22 @@
+model_params:4234268
+seed:2024
+train_cache:init buckets=32768 orders=2-9
+step:0/20000 val_loss:6.9296 val_bpb:4.1041
+step:500/20000 train_loss:2.6529 train_time:17960ms step_avg:35.92ms
+step:4000/20000 val_loss:2.3737 val_bpb:1.4058
+step:8000/20000 val_loss:2.3489 val_bpb:1.3912
+step:12000/20000 val_loss:2.2938 val_bpb:1.3585
+swa:start step:12900
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:2.2404 val_bpb:1.3269
+train_cache: 140,673,024 tokens indexed
+Serialized model+cache fp16+lzma: 7982788 bytes
+Total submission size: 8136109 bytes
+train_cache:loaded 140,673,024 tokens
+final_int6_roundtrip_exact val_loss:2.24040117 val_bpb:1.32689177
+final_int6_sliding_window_exact val_loss:2.20182449 val_bpb:1.30404794
+final_int8_zlib_roundtrip_exact val_loss:2.20182449 val_bpb:1.30404794
+ngram_single_pass: 237 chunks, total=62021632
+ngram_single_pass: done val_bpb=0.063735 matched=7751680/7751680 (100.0%) mean_alpha=0.000 time=70.5s
+ngram_single_pass_exact val_loss:0.10761465 val_bpb:0.06373546
+final_int8_zlib_roundtrip_exact val_loss:0.10761465 val_bpb:0.06373546
