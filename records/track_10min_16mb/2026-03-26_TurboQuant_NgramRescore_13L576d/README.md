@@ -67,8 +67,26 @@ done
 - PR #287: Partial RoPE, LN Scale, EMA, XSA
 - TurboQuant: Novel rotation-based quantization with Lloyd-Max codebooks
 
-## Lessons Learned
-- TurboQuant at 2/3/4-bit has 0.33 BPB quantization penalty vs int6's 0.008
-- The n-gram cache recovers most of this gap (1.48 -> 0.165)
-- For cache-dominated submissions, model quality matters less than cache quality
-- More parameters (44M vs 27M) help marginally when the cache handles 100% of tokens
+## On TurboQuant: Claims vs Reality
+
+Google's [TurboQuant blog post](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) claims "zero accuracy loss" at 3-4 bit quantization via PolarQuant rotation + QJL error correction, tested on KV cache compression for inference. The marketing is seductive: 6x memory reduction with "perfect downstream results across all benchmarks."
+
+**This submission is a stress test of those claims applied to weight quantization in a parameter-constrained setting.** The results are sobering:
+
+| Metric | int6 (PR #870) | TurboQuant 2/3/4-bit (this) |
+|--------|---------------|---------------------------|
+| Bits per element (avg) | 6.0 | ~2.7 |
+| Reconstruction MSE | 0.0000086 | 0.000183 (21x worse) |
+| Quant penalty (BPB) | 0.008 | **0.33** (41x worse) |
+| Params in 16MB | 27M | 44M (+64%) |
+| Final BPB (with n-gram) | 0.0935 | 0.1653 |
+
+**The 64% more parameters do not compensate for the 41x worse quantization penalty.** The rotation + Lloyd-Max codebook approach is theoretically optimal for Gaussian-distributed weights at a given bit width, but 2-3 bits is simply too few for weight matrices. Google's "zero accuracy loss" claim is for KV cache quantization at 3-4 bits on large models (8B+ params) where individual cache entry precision matters less. For weight quantization on small models where every bit counts, the story is very different.
+
+**Key findings:**
+1. At 2-bit (MLP up projections), only 4 centroids represent 576 dimensions. The directional information loss is catastrophic regardless of rotation quality.
+2. Progressive QAT (4->3->2 bit during warmdown) gives the model ~1,000 steps to adapt, but this is insufficient for the model to learn to compensate for the noise floor.
+3. The n-gram cache acts as a powerful error-correction layer, recovering 1.31 BPB of the 1.48 post-quant score. Without the cache, TurboQuant at these bit widths would be unusable.
+4. At equal bit widths (6-bit TurboQuant vs 6-bit per-row), the rotation approach would likely win. But the whole point of TurboQuant is going lower — and at 2-3 bits, the theory breaks down.
+
+**Bottom line:** TurboQuant is a real technique with real advantages at moderate compression ratios (4-6 bit). The "zero accuracy loss" marketing does not extend to aggressive 2-3 bit weight quantization. For this competition, simple int6 per-row quantization with fewer parameters outperforms TurboQuant with more parameters by 0.07 BPB.
