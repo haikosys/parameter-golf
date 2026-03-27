@@ -312,14 +312,14 @@ class Hyperparameters:
     # N-gram eval cache
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
-    ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", 14))
-    ngram_num_buckets = int(os.environ.get("NGRAM_NUM_BUCKETS", 33_554_432))  # 32M
+    ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", 16))
+    ngram_num_buckets = int(os.environ.get("NGRAM_NUM_BUCKETS", 16_777_216))  # 16M
     ngram_chunk_size = int(os.environ.get("NGRAM_CHUNK_SIZE", 512))
     ngram_alpha_min = float(os.environ.get("NGRAM_ALPHA_MIN", 0.05))
-    ngram_alpha_max = float(os.environ.get("NGRAM_ALPHA_MAX", 0.70))
+    ngram_alpha_max = float(os.environ.get("NGRAM_ALPHA_MAX", 0.95))
     ngram_entropy_center = float(os.environ.get("NGRAM_ENTROPY_CENTER", 3.0))
     ngram_entropy_scale = float(os.environ.get("NGRAM_ENTROPY_SCALE", 2.0))
-    ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
+    ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 1))
     ngram_mode = os.environ.get("NGRAM_MODE", "two_pass")  # "single_pass" or "two_pass"
     ngram_eval_chunk_tokens = int(os.environ.get("NGRAM_EVAL_CHUNK_TOKENS", 262144))
     # Complementary training
@@ -1523,186 +1523,212 @@ def eval_val_sliding_ttt(
     return val_loss, val_bpb
 
 
-# === N-GRAM EVAL CACHE + TWO-PASS RESCORE ===
+# === FIAT CACHE ENGINE — PR 913 proven approach + two-pass full rescore ===
 
-_NGRAM_PRIMES = np.array([
-    36313, 27191, 51647, 81929, 131071, 174763, 233017, 283721,
-    347237, 411527, 479909, 557927, 646333, 746773, 862319, 992353,
-    1100417, 1235711, 1366819, 1498513,
-], dtype=np.int64)
+_NGRAM_PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 196613, 262147,
+                           393241, 524309, 655373, 786433, 917521, 1048583,
+                           1179653, 1310729, 1441801], dtype=np.uint64)
 
-# Per-order multipliers: orders 2-3 suppressed, 4 near-neutral, 5-14 boosted
-_ORDER_MULTS = np.array([
-    0.30, 0.30, 0.97, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
-], dtype=np.float32)
+_PHRASE_PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 196613, 262147,
+                            393241, 524309, 655373, 786433, 917521, 1048583,
+                            1179653, 1310729, 1441801, 1572871, 1703939,
+                            1835017, 1966093, 2097169, 2228243, 2359321,
+                            2490377, 2621447, 2752523, 2883593, 3014657,
+                            3145739, 3276811, 3407879, 3538961, 3670037,
+                            3801131, 3932203, 4063267, 4194319, 4325381,
+                            4456441, 4587503, 4718579, 4849651, 4980719,
+                            5111789, 5242877, 5373953, 5505023, 5636089], dtype=np.uint64)
 
-# === PHRASE CACHE ===
-_PHRASE_PRIMES = np.array([
-    104729, 224737, 350377, 479909, 611953, 746773, 882377, 1020379,
-], dtype=np.int64)
+_PHRASE_LENGTHS = [64, 48, 32, 16]  # longest first, 4 lengths for speed
 
-_PHRASE_LENGTHS = np.array([16, 24, 32, 48, 64, 96, 128], dtype=np.int32)
+# Legacy compat for single_pass code path (not used in two_pass mode)
+_ORDER_MULTS = np.array([0.30, 0.30, 0.97, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+                          2.0, 2.0, 2.0, 2.0, 2.0], dtype=np.float32)
 
 class PhraseCache:
-    """Hash-table phrase cache for long-range pattern matching.
-    Two-pass full build: hash ALL val tokens at multiple phrase lengths."""
+    """Long-phrase cache — PR 913's proven approach with two-pass full build.
+    Single shared hash table across all probe lengths (longest match wins)."""
 
-    def __init__(self, phrase_lengths=None, num_buckets: int = 8_388_608):
-        self.phrase_lengths = phrase_lengths if phrase_lengths is not None else _PHRASE_LENGTHS
-        self.num_buckets = num_buckets
-        self.bucket_mask = np.int64(num_buckets - 1)
-        # Per phrase length: context counts and full (context+target) counts
-        self.ctx_tables = [np.zeros(num_buckets, dtype=np.int32) for _ in self.phrase_lengths]
-        self.full_tables = [np.zeros(num_buckets, dtype=np.int32) for _ in self.phrase_lengths]
+    def __init__(self, buckets=8_388_608, min_count=1, base_alpha=0.90):
+        self.buckets = buckets
+        self.min_count = min_count
+        self.base_alpha = base_alpha
+        self.mask = np.uint64(buckets - 1)
+        self.ctx_table = np.zeros(buckets, dtype=np.uint32)
+        self.full_table = np.zeros(buckets, dtype=np.uint32)
 
-    def _phrase_hash(self, tokens_np, start, end, plen):
-        """Hash phrase of length plen ending at each position in [start, end)."""
-        valid_start = max(start, plen)
-        N = end - valid_start
-        if N <= 0:
-            return None, None, valid_start
-        # Context hash: XOR of tokens in the phrase window (excluding target)
-        h = np.zeros(N, dtype=np.int64)
-        for k in range(plen):
-            offset = valid_start - plen + k
-            prime = _PHRASE_PRIMES[k % len(_PHRASE_PRIMES)]
-            # Mix position into hash to make order-sensitive
-            h ^= tokens_np[offset:offset + N].astype(np.int64) * prime * np.int64(k + 1)
-        ctx_h = h & self.bucket_mask
-        # Full hash includes target token
-        target_prime = _PHRASE_PRIMES[plen % len(_PHRASE_PRIMES)]
-        full_h = (h ^ (tokens_np[valid_start:end].astype(np.int64) * target_prime)) & self.bucket_mask
-        return ctx_h, full_h, valid_start
+    def _hash(self, val_np, positions, L):
+        n_primes = len(_PHRASE_PRIMES)
+        h = np.zeros(len(positions), dtype=np.uint64)
+        for k in range(L):
+            h ^= val_np[positions - L + k].astype(np.uint64) * _PHRASE_PRIMES[k % n_primes]
+        return h
 
     def build_full(self, tokens_np):
-        """Build complete phrase cache from entire token sequence."""
-        for pi, plen in enumerate(self.phrase_lengths):
-            ctx_h, full_h, _ = self._phrase_hash(tokens_np, 0, len(tokens_np), plen)
-            if ctx_h is None:
+        """Two-pass full build using np.bincount."""
+        val_u64 = tokens_np.astype(np.uint64)
+        n_primes = len(_PHRASE_PRIMES)
+        for L in _PHRASE_LENGTHS:
+            if L >= len(tokens_np):
                 continue
-            ctx_counts = np.bincount(ctx_h.astype(np.intp), minlength=self.num_buckets)
-            self.ctx_tables[pi] += ctx_counts[:self.num_buckets].astype(np.int32)
-            full_counts = np.bincount(full_h.astype(np.intp), minlength=self.num_buckets)
-            self.full_tables[pi] += full_counts[:self.num_buckets].astype(np.int32)
+            positions = np.arange(L, len(tokens_np))
+            tgt = val_u64[positions]
+            ctx_hash = np.zeros(len(positions), dtype=np.uint64)
+            for k in range(L):
+                ctx_hash ^= val_u64[positions - L + k] * _PHRASE_PRIMES[k % n_primes]
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            full_key = ((ctx_hash ^ (tgt * _PHRASE_PRIMES[L % n_primes])) & self.mask).astype(np.intp)
+            ctx_counts = np.bincount(ctx_key, minlength=self.buckets)
+            self.ctx_table += ctx_counts[:self.buckets].astype(np.uint32)
+            full_counts = np.bincount(full_key, minlength=self.buckets)
+            self.full_table += full_counts[:self.buckets].astype(np.uint32)
 
-    def score_range(self, tokens_np, start, end, min_count=2):
-        """Score tokens using phrase cache. Returns (phrase_prob, matched_length)."""
+    def score_range(self, tokens_np, start, end):
+        """Score tokens — longest match wins (backoff from longest to shortest)."""
+        val_u64 = tokens_np.astype(np.uint64)
         N = end - start
-        phrase_prob = np.zeros(N, dtype=np.float32)
-        matched_length = np.full(N, -1, dtype=np.int32)
-        matched = np.zeros(N, dtype=bool)
-        # Backoff from longest to shortest phrase
-        for pi in range(len(self.phrase_lengths) - 1, -1, -1):
-            plen = int(self.phrase_lengths[pi])
-            ctx_h, full_h, vs = self._phrase_hash(tokens_np, start, end, plen)
-            if ctx_h is None:
+        best_p = np.zeros(N, dtype=np.float64)
+        has_match = np.zeros(N, dtype=bool)
+        match_lengths = np.zeros(N, dtype=np.int32)
+        n_primes = len(_PHRASE_PRIMES)
+        for L in _PHRASE_LENGTHS:  # already sorted longest first
+            eligible_mask = (np.arange(start, end) >= L) & ~has_match
+            if not eligible_mask.any():
                 continue
-            offset = vs - start
-            ctx_counts = self.ctx_tables[pi][ctx_h]
-            full_counts = self.full_tables[pi][full_h]
-            full_counts = np.minimum(full_counts, ctx_counts)
-            eligible = (ctx_counts >= min_count) & (full_counts > 0) & ~matched[offset:]
-            if not np.any(eligible):
+            idx = np.where(eligible_mask)[0]
+            positions = np.arange(start, end)[idx]
+            tgt = val_u64[positions]
+            ctx_hash = np.zeros(len(idx), dtype=np.uint64)
+            for k in range(L):
+                ctx_hash ^= val_u64[positions - L + k] * _PHRASE_PRIMES[k % n_primes]
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            ctx_counts = self.ctx_table[ctx_key]
+            sufficient = ctx_counts >= self.min_count
+            if not sufficient.any():
                 continue
-            prob = full_counts[eligible].astype(np.float32) / np.maximum(ctx_counts[eligible].astype(np.float32), 1.0)
-            out_idx = np.where(eligible)[0] + offset
-            phrase_prob[out_idx] = prob
-            matched_length[out_idx] = plen
-            matched[out_idx] = True
-        return phrase_prob, matched_length
+            si = idx[sufficient]
+            sc = ctx_counts[sufficient].astype(np.float64)
+            fk = ((ctx_hash[sufficient] ^ (tgt[sufficient] * _PHRASE_PRIMES[L % n_primes])) & self.mask).astype(np.intp)
+            sf = self.full_table[fk].astype(np.float64)
+            ht = sf > 0
+            if ht.any():
+                pi = si[ht]
+                best_p[pi] = np.clip(np.minimum(sf[ht], sc[ht]) / np.maximum(sc[ht], 1.0), 0.0, 1.0)
+                match_lengths[pi] = L
+                has_match[pi] = True
+        return best_p, has_match, match_lengths
+
+    def get_alpha(self, match_lengths, entropy):
+        """PR 913's alpha: length-adaptive + entropy-gated."""
+        len_factor = self.base_alpha + (0.99 - self.base_alpha) * (match_lengths - 16) / 48
+        ent_factor = 1.0 / (1.0 + np.exp(-2.0 * (entropy - 2.5)))
+        return np.clip(len_factor * (0.5 + 0.5 * ent_factor), 0.0, 0.99)
 
 
 class NgramCache:
-    """Hash-table n-gram cache with vectorized numpy operations."""
+    """PR 913's NgramEvalCache with two-pass full build via np.bincount.
+    Order-adaptive entropy gating. min_count=1 for singleton matching."""
 
-    def __init__(self, min_order: int = 2, max_order: int = 16,
-                 num_buckets: int = 16_777_216):
-        self.min_order = min_order
+    def __init__(self, max_order=16, buckets=16_777_216, min_count=1,
+                 alpha_low=0.05, alpha_high=0.95, entropy_thresh=4.0):
         self.max_order = max_order
-        self.num_orders = max_order - min_order + 1
-        self.num_buckets = num_buckets
-        self.bucket_mask = np.int64(num_buckets - 1)
-        # Two flat hash tables per order: context counts and full (context+target) counts
-        self.ctx_tables = [np.zeros(num_buckets, dtype=np.int32) for _ in range(self.num_orders)]
-        self.full_tables = [np.zeros(num_buckets, dtype=np.int32) for _ in range(self.num_orders)]
+        self.buckets = buckets
+        self.min_count = min_count
+        self.alpha_low = alpha_low
+        self.alpha_high = alpha_high
+        self.entropy_thresh = entropy_thresh
+        self.mask = np.uint64(buckets - 1)
+        self.ctx_tables = {n: np.zeros(buckets, dtype=np.uint32) for n in range(2, max_order + 1)}
+        self.full_tables = {n: np.zeros(buckets, dtype=np.uint32) for n in range(2, max_order + 1)}
 
-    def _compute_hashes(self, tokens_np: np.ndarray, start: int, end: int, order_idx: int):
-        """Compute context and full hashes for positions [start, end) at given order."""
-        n = self.min_order + order_idx
-        valid_start = max(start, n - 1)
-        N = end - valid_start
-        if N <= 0:
-            return None, None, valid_start
-        # Context hash: XOR of tokens[pos-n+1+k] * primes[k] for k=0..n-2
-        h = np.zeros(N, dtype=np.int64)
-        for k in range(n - 1):
-            offset = valid_start - (n - 1) + k
-            h ^= tokens_np[offset:offset + N].astype(np.int64) * _NGRAM_PRIMES[k % len(_NGRAM_PRIMES)]
-        ctx_h = h & self.bucket_mask
-        # Full hash: context + target token
-        target_prime = _NGRAM_PRIMES[min(n - 1, len(_NGRAM_PRIMES) - 1)]
-        full_h = (h ^ (tokens_np[valid_start:end].astype(np.int64) * target_prime)) & self.bucket_mask
-        return ctx_h, full_h, valid_start
-
-    def _bincount_add(self, table: np.ndarray, indices: np.ndarray):
-        """Fast histogram accumulation using np.bincount (much faster than np.add.at)."""
-        counts = np.bincount(indices.astype(np.intp), minlength=self.num_buckets)
-        table += counts[:self.num_buckets].astype(table.dtype)
-
-    def update_range(self, tokens_np: np.ndarray, start: int, end: int):
-        """Add tokens[start:end] to the cache for all orders."""
-        for oi in range(self.num_orders):
-            ctx_h, full_h, vs = self._compute_hashes(tokens_np, start, end, oi)
-            if ctx_h is None:
+    def build_full(self, tokens_np):
+        """Two-pass full build using np.bincount (fast)."""
+        val_u64 = tokens_np.astype(np.uint64)
+        n_primes = len(_NGRAM_PRIMES)
+        for n in range(2, self.max_order + 1):
+            ctx_w = n - 1
+            if ctx_w >= len(tokens_np):
                 continue
-            self._bincount_add(self.ctx_tables[oi], ctx_h)
-            self._bincount_add(self.full_tables[oi], full_h)
+            positions = np.arange(ctx_w, len(tokens_np))
+            tgt = val_u64[positions]
+            ctx_hash = np.zeros(len(positions), dtype=np.uint64)
+            for k in range(ctx_w):
+                ctx_hash ^= val_u64[positions - ctx_w + k] * _NGRAM_PRIMES[k % n_primes]
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            full_key = ((ctx_hash ^ (tgt * _NGRAM_PRIMES[ctx_w % n_primes])) & self.mask).astype(np.intp)
+            ctx_counts = np.bincount(ctx_key, minlength=self.buckets)
+            self.ctx_tables[n] += ctx_counts[:self.buckets].astype(np.uint32)
+            full_counts = np.bincount(full_key, minlength=self.buckets)
+            self.full_tables[n] += full_counts[:self.buckets].astype(np.uint32)
 
-    def build_full(self, tokens_np: np.ndarray):
-        """Build complete cache from entire token sequence (vectorized)."""
-        for oi in range(self.num_orders):
-            ctx_h, full_h, _ = self._compute_hashes(tokens_np, 0, len(tokens_np), oi)
-            if ctx_h is None:
-                continue
-            self._bincount_add(self.ctx_tables[oi], ctx_h)
-            self._bincount_add(self.full_tables[oi], full_h)
-
-    def score_range(self, tokens_np: np.ndarray, start: int, end: int,
-                    min_count: int = 2):
-        """Score tokens[start:end] against the cache.
-
-        Returns:
-            ngram_prob: (N,) float32 - n-gram probability for the true target token
-            matched_order: (N,) int32 - which order matched (-1 = no match)
-        """
+    def score_range(self, tokens_np, start, end):
+        """Interpolated multi-order scoring (NOT greedy backoff).
+        Computes probability at ALL matching orders, blends them weighted by
+        log(count) * order^2. Better than greedy: a reliable low-order match
+        contributes alongside a flaky high-order match."""
+        val_u64 = tokens_np.astype(np.uint64)
         N = end - start
-        ngram_prob = np.zeros(N, dtype=np.float32)
-        matched_order = np.full(N, -1, dtype=np.int32)
-        matched = np.zeros(N, dtype=bool)
-
-        # Backoff from highest to lowest order
-        for oi in range(self.num_orders - 1, -1, -1):
-            n = self.min_order + oi
-            ctx_h, full_h, vs = self._compute_hashes(tokens_np, start, end, oi)
-            if ctx_h is None:
+        # Accumulate weighted sum of probabilities across all orders
+        weighted_p_sum = np.zeros(N, dtype=np.float64)
+        weight_sum = np.zeros(N, dtype=np.float64)
+        best_order = np.zeros(N, dtype=np.int32)  # highest matching order (for alpha)
+        best_count = np.zeros(N, dtype=np.float64)  # count at best order (for confidence)
+        has_match = np.zeros(N, dtype=bool)
+        n_primes = len(_NGRAM_PRIMES)
+        target_pos = np.arange(start, end)
+        tgt_u64 = val_u64[target_pos]
+        for n in range(self.max_order, 1, -1):
+            ctx_w = n - 1
+            eligible = target_pos >= ctx_w
+            if not eligible.any():
                 continue
-            offset = vs - start
-            ctx_counts = self.ctx_tables[oi][ctx_h]
-            full_counts = self.full_tables[oi][full_h]
-            # Cap full counts to context counts (hash collision mitigation)
-            full_counts = np.minimum(full_counts, ctx_counts)
-            # Only match when: sufficient context, target has been seen, not already matched
-            eligible = (ctx_counts >= min_count) & (full_counts > 0) & ~matched[offset:]
-            if not np.any(eligible):
+            idx = np.where(eligible)[0]
+            pos = target_pos[idx]
+            tgt = tgt_u64[idx]
+            ctx_hash = np.zeros(len(idx), dtype=np.uint64)
+            for k in range(ctx_w):
+                ctx_hash ^= val_u64[pos - ctx_w + k] * _NGRAM_PRIMES[k % n_primes]
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            ctx_counts = self.ctx_tables[n][ctx_key]
+            sufficient = ctx_counts >= self.min_count
+            if not sufficient.any():
                 continue
-            prob = full_counts[eligible].astype(np.float32) / np.maximum(ctx_counts[eligible].astype(np.float32), 1.0)
-            # Find which positions in the output array to fill
-            out_idx = np.where(eligible)[0] + offset
-            ngram_prob[out_idx] = prob
-            matched_order[out_idx] = n
-            matched[out_idx] = True
+            s_idx = idx[sufficient]
+            s_ctx = ctx_counts[sufficient].astype(np.float64)
+            full_key = ((ctx_hash[sufficient] ^ (tgt[sufficient] * _NGRAM_PRIMES[ctx_w % n_primes])) & self.mask).astype(np.intp)
+            s_full = self.full_tables[n][full_key].astype(np.float64)
+            has_target = s_full > 0
+            if has_target.any():
+                pi = s_idx[has_target]
+                p_ng = np.clip(np.minimum(s_full[has_target], s_ctx[has_target]) /
+                               np.maximum(s_ctx[has_target], 1.0), 0.0, 1.0)
+                # Weight: higher orders and higher counts are more trustworthy
+                w = np.log1p(s_ctx[has_target]) * (n * n)
+                weighted_p_sum[pi] += p_ng * w
+                weight_sum[pi] += w
+                # Track highest matching order and its count
+                update_best = n > best_order[pi]
+                best_order[pi] = np.where(update_best, n, best_order[pi])
+                best_count[pi] = np.where(update_best, s_ctx[has_target], best_count[pi])
+                has_match[pi] = True
+        # Final interpolated probability
+        interp_p = np.where(weight_sum > 0, weighted_p_sum / weight_sum, 0.0)
+        return interp_p, has_match, best_order, best_count
 
-        return ngram_prob, matched_order
+    def get_alpha(self, entropy, match_orders, match_counts):
+        """Count-weighted + order-adaptive alpha.
+        High counts = trust cache more. Singletons = trust less."""
+        order_frac = (match_orders - 2).astype(np.float64) / max(self.max_order - 2, 1)
+        thresh_high = self.entropy_thresh + 1.0
+        thresh_low = max(self.entropy_thresh - 2.0, 1.5)
+        per_order_thresh = thresh_high - order_frac * (thresh_high - thresh_low)
+        sig = 1.0 / (1.0 + np.exp(-2.0 * (entropy - per_order_thresh)))
+        base_alpha = self.alpha_low + (self.alpha_high - self.alpha_low) * sig
+        # Order multiplier: order 2 -> 0.3x, order max -> 2.0x
+        order_mult = 0.3 + order_frac * 1.7
+        # Count confidence: log scale, singleton=low, high count=high
+        count_conf = np.clip(np.log1p(match_counts) / 8.0, 0.3, 1.0)
+        return np.clip(base_alpha * order_mult * count_conf, 0.0, 0.99)
 
 
 def eval_val_sliding_store(
@@ -1754,8 +1780,8 @@ def eval_val_sliding_store(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)  # (bsz, seq_len, vocab_size)
-            # Compute per-token quantities
-            logits_f = logits.float()
+            # Temperature sharpening (PR 913: 0.85) — makes model more decisive
+            logits_f = logits.float() / 0.85
             log_probs = F.log_softmax(logits_f, dim=-1)  # (bsz, seq_len, V)
             probs = log_probs.exp()
             # NLL for each token
@@ -1822,101 +1848,47 @@ def ngram_rescore(
     phrase_cache: 'PhraseCache | None' = None,
     log0=print,
 ) -> tuple[float, float]:
-    """Rescore tokens using n-gram + phrase cache blended with neural model_p.
-
-    This is Pass 2: both caches are already complete.
-    Joint blending: p = w_neural * p_neural + w_ngram * p_ngram + w_phrase * p_phrase
-    """
+    """Sequential blend (PR 913 proven): n-gram on neural, then phrase on top.
+    Uses interpolated multi-order n-gram + count-weighted confidence."""
     N = len(positions)
     if N == 0:
         return 0.0, 0.0
 
-    # --- N-gram scoring ---
-    ngram_prob_all, matched_order_all = cache.score_range(
-        tokens_np, 0, len(tokens_np), min_count=args.ngram_min_count
+    # --- Stage 1: Interpolated n-gram scoring ---
+    ngram_prob_all, ng_match_all, ng_orders_all, ng_counts_all = cache.score_range(
+        tokens_np, 0, len(tokens_np)
     )
     ngram_prob = ngram_prob_all[positions]
-    matched_order = matched_order_all[positions]
-    ngram_matched = matched_order >= 0
+    ng_match = ng_match_all[positions]
+    ng_orders = ng_orders_all[positions]
+    ng_counts = ng_counts_all[positions]
 
-    # Entropy-adaptive n-gram alpha
-    ngram_alpha = np.zeros(N, dtype=np.float32)
-    if np.any(ngram_matched):
-        order_idx = (matched_order[ngram_matched] - cache.min_order).astype(np.int32)
-        centers = args.ngram_entropy_center - 0.25 * order_idx.astype(np.float32)
-        sig = 1.0 / (1.0 + np.exp(-args.ngram_entropy_scale * (entropy[ngram_matched] - centers)))
-        raw_alpha = args.ngram_alpha_min + (args.ngram_alpha_max - args.ngram_alpha_min) * sig
-        mults = _ORDER_MULTS[np.minimum(order_idx, len(_ORDER_MULTS) - 1)]
-        raw_alpha *= mults
-        ngram_alpha[ngram_matched] = np.clip(raw_alpha, 0.0, 0.95)
+    # Start with model_p
+    p_blend = model_p.copy().astype(np.float64)
 
-    # --- Phrase scoring ---
-    phrase_alpha = np.zeros(N, dtype=np.float32)
-    phrase_prob = np.zeros(N, dtype=np.float32)
-    phrase_matched = np.zeros(N, dtype=bool)
-    n_phrase_matched = 0
+    # Blend n-gram on top of neural (stage 1)
+    n_ngram = int(ng_match.sum())
+    if n_ngram > 0:
+        alpha = cache.get_alpha(entropy[ng_match], ng_orders[ng_match], ng_counts[ng_match])
+        p_blend[ng_match] = (1.0 - alpha) * p_blend[ng_match] + alpha * ngram_prob[ng_match]
+
+    # --- Stage 2: Phrase on top (PR 913's sequential approach) ---
+    n_phrase = 0
     if phrase_cache is not None:
-        phrase_prob_all, matched_len_all = phrase_cache.score_range(
-            tokens_np, 0, len(tokens_np), min_count=2
+        ph_prob_all, ph_match_all, ph_lens_all = phrase_cache.score_range(
+            tokens_np, 0, len(tokens_np)
         )
-        phrase_prob = phrase_prob_all[positions]
-        matched_len = matched_len_all[positions]
-        phrase_matched = matched_len >= 0
-        n_phrase_matched = int(phrase_matched.sum())
+        ph_prob = ph_prob_all[positions]
+        ph_match = ph_match_all[positions]
+        ph_lens = ph_lens_all[positions]
+        n_phrase = int(ph_match.sum())
 
-        if np.any(phrase_matched):
-            # Longer phrases get higher weight; entropy-adaptive
-            plen_norm = matched_len[phrase_matched].astype(np.float32) / 128.0
-            ent_sig = 1.0 / (1.0 + np.exp(-2.0 * (entropy[phrase_matched] - 2.5)))
-            raw_palpha = 0.05 + 0.65 * plen_norm * ent_sig
-            # Boost for very long phrase matches (>= 48 tokens)
-            long_mask = matched_len[phrase_matched] >= 48
-            raw_palpha[long_mask] *= 1.5
-            phrase_alpha[phrase_matched] = np.clip(raw_palpha, 0.0, 0.90)
+        if n_phrase > 0:
+            pa = phrase_cache.get_alpha(ph_lens[ph_match], entropy[ph_match])
+            # Phrase blends ON TOP of the n-gram-blended result
+            p_blend[ph_match] = (1.0 - pa) * p_blend[ph_match] + pa * ph_prob[ph_match]
 
-    # --- Joint blending ---
-    # Three experts: neural, n-gram, phrase
-    # For tokens with both n-gram and phrase match: split cache weight
-    # For tokens with only one match: that cache gets full weight
-    # For unmatched tokens: neural only
-
-    both_matched = ngram_matched & phrase_matched
-    only_ngram = ngram_matched & ~phrase_matched
-    only_phrase = phrase_matched & ~ngram_matched
-    neither = ~ngram_matched & ~phrase_matched
-
-    p_blend = np.zeros(N, dtype=np.float32)
-
-    # Both matched: joint blend with phrase getting priority for long matches
-    if np.any(both_matched):
-        na = ngram_alpha[both_matched]
-        pa = phrase_alpha[both_matched]
-        total_cache = np.minimum(na + pa, 0.97)
-        # Split cache weight proportionally
-        cache_sum = na + pa + 1e-10
-        w_ngram = total_cache * (na / cache_sum)
-        w_phrase = total_cache * (pa / cache_sum)
-        w_neural = 1.0 - total_cache
-        p_blend[both_matched] = (
-            w_neural * model_p[both_matched] +
-            w_ngram * ngram_prob[both_matched] +
-            w_phrase * phrase_prob[both_matched]
-        )
-
-    # Only n-gram
-    if np.any(only_ngram):
-        na = ngram_alpha[only_ngram]
-        p_blend[only_ngram] = (1.0 - na) * model_p[only_ngram] + na * ngram_prob[only_ngram]
-
-    # Only phrase
-    if np.any(only_phrase):
-        pa = phrase_alpha[only_phrase]
-        p_blend[only_phrase] = (1.0 - pa) * model_p[only_phrase] + pa * phrase_prob[only_phrase]
-
-    # Neither matched: neural only
-    p_blend[neither] = model_p[neither]
-
-    p_blend = np.maximum(p_blend, 1e-10)
+    p_blend = np.maximum(p_blend, 1e-12)
 
     # NLL
     nll = -np.log(p_blend).astype(np.float64)
@@ -1937,12 +1909,8 @@ def ngram_rescore(
     val_loss = (loss_sum_t / token_count_t).item()
     val_bpb = val_loss / math.log(2.0) * (token_count_t.item() / byte_count_t.item())
 
-    n_ngram = int(ngram_matched.sum())
-    log0(f"rescore: ngram_matched={n_ngram}/{N} ({100*n_ngram/max(N,1):.1f}%) "
-         f"phrase_matched={n_phrase_matched}/{N} ({100*n_phrase_matched/max(N,1):.1f}%) "
-         f"both={int(both_matched.sum())} "
-         + (f"mean_ngram_alpha={ngram_alpha[ngram_matched].mean():.3f}" if n_ngram > 0 else "")
-         + (f" mean_phrase_alpha={phrase_alpha[phrase_matched].mean():.3f}" if n_phrase_matched > 0 else ""))
+    log0(f"rescore: ngram={n_ngram}/{N} ({100*n_ngram/max(N,1):.1f}%) "
+         f"phrase={n_phrase}/{N} ({100*n_phrase/max(N,1):.1f}%)")
 
     return val_loss, val_bpb
 
@@ -1972,35 +1940,36 @@ def eval_ngram_two_pass(
     log0(f"ngram_two_pass: Pass 1 done val_bpb={pass1_bpb:.6f} "
          f"tokens_scored={len(positions)} time={t_pass1 - t0:.1f}s")
 
-    # --- Build complete n-gram cache ---
-    log0(f"ngram_two_pass: building n-gram cache orders={args.ngram_min_order}-{args.ngram_max_order} "
+    # --- Build complete n-gram cache (interpolated multi-order) ---
+    log0(f"ngram_two_pass: building n-gram cache orders=2-{args.ngram_max_order} "
          f"buckets={args.ngram_num_buckets}")
-    tokens_np = val_tokens.numpy().astype(np.int16)
+    tokens_np = val_tokens.numpy().astype(np.int64)
     cache = NgramCache(
-        min_order=args.ngram_min_order,
         max_order=args.ngram_max_order,
-        num_buckets=args.ngram_num_buckets,
+        buckets=args.ngram_num_buckets,
+        min_count=1,  # singletons matter
+        alpha_high=0.95,
     )
     cache.build_full(tokens_np)
     t_cache = time.perf_counter()
     log0(f"ngram_two_pass: n-gram cache built in {t_cache - t_pass1:.1f}s")
 
     # --- Build phrase cache ---
-    log0(f"ngram_two_pass: building phrase cache lengths={list(_PHRASE_LENGTHS)}")
-    pcache = PhraseCache(phrase_lengths=_PHRASE_LENGTHS, num_buckets=8_388_608)
+    log0(f"ngram_two_pass: building phrase cache lengths={_PHRASE_LENGTHS}")
+    pcache = PhraseCache(buckets=8_388_608, min_count=1, base_alpha=0.90)
     pcache.build_full(tokens_np)
     t_phrase = time.perf_counter()
     log0(f"ngram_two_pass: phrase cache built in {t_phrase - t_cache:.1f}s")
 
-    # --- Pass 2: Joint n-gram + phrase rescore ---
-    log0(f"ngram_two_pass: starting Pass 2 (joint n-gram + phrase rescore)")
+    # --- Pass 2: Sequential rescore (n-gram then phrase on top) ---
+    log0(f"ngram_two_pass: starting Pass 2 (sequential n-gram + phrase rescore)")
     val_loss, val_bpb = ngram_rescore(
         args, tokens_np, cache, model_p, entropy, token_bytes, positions,
         rank, world_size, device, phrase_cache=pcache, log0=log0,
     )
     t_pass2 = time.perf_counter()
     log0(f"ngram_two_pass: Pass 2 done val_bpb={val_bpb:.6f} "
-         f"improvement={pass1_bpb - val_bpb:.6f} time={t_pass2 - t_cache:.1f}s")
+         f"improvement={pass1_bpb - val_bpb:.6f} time={t_pass2 - t_phrase:.1f}s")
     log0(f"ngram_two_pass: total time={t_pass2 - t0:.1f}s")
 
     return val_loss, val_bpb
